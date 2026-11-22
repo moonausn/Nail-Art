@@ -1,7 +1,7 @@
 {
   "name": "nailarts-backend",
   "version": "1.0.0",
-  "description": "Backend API for Nail Arts Blog",
+  "description": "Backend API for Nail Arts For Girls — Firestore + Catbox image upload",
   "main": "api/index.js",
   "scripts": {
     "dev": "node api/index.js",
@@ -16,5 +16,13 @@
   },
   "engines": {
     "node": "26.x"
-  }
+  },
+  "keywords": [
+    "nail-art",
+    "blog",
+    "api",
+    "firestore",
+    "catbox"
+  ],
+  "license": "MIT"
 }

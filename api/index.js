@@ -1,18 +1,16 @@
 // ===================================================
 // Nail Arts Blog - Backend API
-// All routes in one file, deploy on Vercel
-// Image upload: Catbox.moe (free, no billing)
+// Firestore-only storage (images as base64 data URIs)
+// Deploy: Vercel
 // ===================================================
 const express = require('express');
 const cors = require('cors');
 const jwt = require('jsonwebtoken');
-const multer = require('multer');
 const admin = require('firebase-admin');
 
-// ---------- Firebase Admin Init (Firestore only) ----------
+// ---------- Firebase Admin Init ----------
 if (!admin.apps.length) {
   let privateKey = process.env.FIREBASE_PRIVATE_KEY || '';
-  // Vercel env me "\n" text milta hai, usko real newline me convert karo
   privateKey = privateKey.replace(/\\n/g, '\n').replace(/^"|"$/g, '');
 
   admin.initializeApp({
@@ -29,12 +27,10 @@ const db = admin.firestore();
 // ---------- App Setup ----------
 const app = express();
 app.use(cors());
-app.use(express.json({ limit: '2mb' }));
 
-const upload = multer({
-  storage: multer.memoryStorage(),
-  limits: { fileSize: 10 * 1024 * 1024 }, // 10MB (Catbox supports more, but keep safe)
-});
+// Base64 images JSON me aati hain, isliye limit barha diya
+// (Firestore doc limit 1MB hai, lekin hum 850KB pe cap karte hain)
+app.use(express.json({ limit: '3mb' }));
 
 // ---------- Helpers ----------
 const slugify = (text) =>
@@ -45,7 +41,7 @@ const slugify = (text) =>
     .replace(/[^a-z0-9]+/g, '-')
     .replace(/^-|-$/g, '');
 
-// Admin auth middleware (JWT verify)
+// Admin auth middleware
 const authMiddleware = (req, res, next) => {
   const authHeader = req.headers.authorization || '';
   if (!authHeader.startsWith('Bearer ')) {
@@ -59,83 +55,49 @@ const authMiddleware = (req, res, next) => {
   }
 };
 
-// Browser-like User-Agent to avoid 412 from Catbox
-const BROWSER_UA =
-  'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36';
+// Validate base64 image (data URI) size
+// Firestore limit 1MB = 1,048,576 bytes
+// Safety cap: 850KB base64 (~600KB raw image after base64 inflation)
+const MAX_IMAGE_BASE64_BYTES = 850 * 1024;
 
-// ---------- Catbox Upload Helper ----------
-async function uploadToCatbox(buffer, mimetype, originalname) {
-  const formData = new FormData();
-  formData.append('reqtype', 'fileupload');
-  if (process.env.CATBOX_USERHASH) {
-    formData.append('userhash', process.env.CATBOX_USERHASH);
-  }
-  formData.append(
-    'fileToUpload',
-    new Blob([buffer], { type: mimetype || 'image/jpeg' }),
-    originalname || 'image.jpg'
-  );
+function validateImageField(imageUrl) {
+  if (!imageUrl) return { ok: true, value: '' };
 
-  const response = await fetch('https://catbox.moe/user/api.php', {
-    method: 'POST',
-    body: formData,
-    headers: {
-      'User-Agent': BROWSER_UA,
-      'Accept': '*/*',
-      'Accept-Language': 'en-US,en;q=0.9',
-    },
-  });
-
-  if (!response.ok) {
-    const errorBody = await response.text().catch(() => '');
-    throw new Error(
-      `Catbox upload failed with status ${response.status}${
-        errorBody ? ` — ${errorBody.substring(0, 200)}` : ''
-      }`
-    );
+  if (typeof imageUrl !== 'string') {
+    return { ok: false, error: 'Invalid image data' };
   }
 
-  const result = (await response.text()).trim();
-
-  // Success response ek seedha URL hota hai
-  if (!/^https?:\/\//i.test(result)) {
-    throw new Error(
-      `Catbox returned invalid response: ${result.substring(0, 200)}`
-    );
+  // External URL allowed (legacy posts)
+  if (!imageUrl.startsWith('data:')) {
+    if (!/^https?:\/\//i.test(imageUrl)) {
+      return { ok: false, error: 'Image must be a data URI or valid URL' };
+    }
+    return { ok: true, value: imageUrl };
   }
 
-  return result;
-}
-
-// ---------- Catbox Delete Helper ----------
-async function deleteFromCatbox(imageUrl) {
-  try {
-    if (!imageUrl || !/catbox\.moe/i.test(imageUrl)) return;
-    if (!process.env.CATBOX_USERHASH) return;
-
-    const filename = imageUrl.split('/').pop();
-    if (!filename) return;
-
-    const formData = new FormData();
-    formData.append('reqtype', 'deletefiles');
-    formData.append('userhash', process.env.CATBOX_USERHASH);
-    formData.append('files', filename);
-
-    await fetch('https://catbox.moe/user/api.php', {
-      method: 'POST',
-      body: formData,
-      headers: { 'User-Agent': BROWSER_UA },
-    });
-  } catch (e) {
-    console.log('Catbox image delete failed:', e.message);
+  // Base64 data URI
+  if (!/^data:image\/(jpeg|jpg|png|webp|gif);base64,/i.test(imageUrl)) {
+    return { ok: false, error: 'Only JPEG, PNG, WEBP or GIF images allowed' };
   }
+
+  // Approximate byte size (base64 chars are ASCII → 1 byte each)
+  const approxBytes = imageUrl.length;
+  if (approxBytes > MAX_IMAGE_BASE64_BYTES) {
+    return {
+      ok: false,
+      error: `Image too large (${Math.round(
+        approxBytes / 1024
+      )}KB). Max 850KB — please compress to under 600KB raw.`,
+    };
+  }
+
+  return { ok: true, value: imageUrl };
 }
 
 // ===================================================
 // AUTH ROUTES
 // ===================================================
 
-// POST /api/login
 app.post('/api/login', (req, res) => {
   const { username, password } = req.body || {};
   if (
@@ -154,7 +116,7 @@ app.post('/api/login', (req, res) => {
 // CATEGORY ROUTES
 // ===================================================
 
-// GET /api/categories  (public)
+// GET /api/categories (public)
 app.get('/api/categories', async (req, res) => {
   try {
     const snap = await db.collection('categories').get();
@@ -168,7 +130,7 @@ app.get('/api/categories', async (req, res) => {
   }
 });
 
-// POST /api/categories  (admin only)
+// POST /api/categories (admin only)
 app.post('/api/categories', authMiddleware, async (req, res) => {
   try {
     const { name } = req.body || {};
@@ -197,7 +159,7 @@ app.post('/api/categories', authMiddleware, async (req, res) => {
   }
 });
 
-// DELETE /api/categories/:id  (admin only)
+// DELETE /api/categories/:id (admin only)
 app.delete('/api/categories/:id', authMiddleware, async (req, res) => {
   try {
     await db.collection('categories').doc(req.params.id).delete();
@@ -208,49 +170,39 @@ app.delete('/api/categories/:id', authMiddleware, async (req, res) => {
 });
 
 // ===================================================
-// IMAGE UPLOAD (via Catbox)
-// ===================================================
-
-// POST /api/upload  (admin only) — multipart form-data, field: "image"
-app.post(
-  '/api/upload',
-  authMiddleware,
-  upload.single('image'),
-  async (req, res) => {
-    try {
-      if (!req.file) {
-        return res.status(400).json({ error: 'No file uploaded' });
-      }
-
-      if (!process.env.CATBOX_USERHASH) {
-        return res
-          .status(500)
-          .json({ error: 'Server misconfigured: CATBOX_USERHASH missing' });
-      }
-
-      const url = await uploadToCatbox(
-        req.file.buffer,
-        req.file.mimetype,
-        req.file.originalname
-      );
-
-      res.json({ url, filename: req.file.originalname });
-    } catch (e) {
-      console.error('Upload error:', e);
-      res.status(500).json({ error: e.message || 'Upload failed' });
-    }
-  }
-);
-
-// ===================================================
 // POST ROUTES
 // ===================================================
 
 // GET /api/posts
+// Returns list — content truncated to 500 chars (excerpt only) to save bandwidth.
+// imageUrl (base64) is returned in full so homepage cards can display images.
 app.get('/api/posts', async (req, res) => {
   try {
     const snap = await db.collection('posts').get();
-    let posts = snap.docs.map((d) => ({ id: d.id, ...d.data() }));
+    let posts = snap.docs.map((d) => {
+      const data = d.data();
+      const plainContent = String(data.content || '')
+        .replace(/<[^>]*>/g, ' ')
+        .replace(/\s+/g, ' ')
+        .trim();
+
+      return {
+        id: d.id,
+        title: data.title || '',
+        slug: data.slug || '',
+        // Truncated preview only for list — full content comes from single-post route
+        content:
+          plainContent.length > 500
+            ? plainContent.slice(0, 500) + '…'
+            : plainContent,
+        imageUrl: data.imageUrl || '',
+        category: data.category || '',
+        tags: Array.isArray(data.tags) ? data.tags : [],
+        createdAt: data.createdAt,
+        updatedAt: data.updatedAt,
+      };
+    });
+
     posts.sort(
       (a, b) => (b.createdAt?._seconds || 0) - (a.createdAt?._seconds || 0)
     );
@@ -265,7 +217,7 @@ app.get('/api/posts', async (req, res) => {
   }
 });
 
-// GET /api/posts/:slug
+// GET /api/posts/:slug (full single post)
 app.get('/api/posts/:slug', async (req, res) => {
   try {
     const snap = await db
@@ -283,7 +235,9 @@ app.get('/api/posts/:slug', async (req, res) => {
   }
 });
 
-// POST /api/posts  (admin only)
+// POST /api/posts (admin only)
+// Body: { title, content, imageUrl, category, tags }
+// imageUrl may be a base64 data URI or external URL
 app.post('/api/posts', authMiddleware, async (req, res) => {
   try {
     const { title, content, imageUrl, category, tags } = req.body || {};
@@ -291,13 +245,16 @@ app.post('/api/posts', authMiddleware, async (req, res) => {
       return res.status(400).json({ error: 'Title and content are required' });
     }
 
+    const imgCheck = validateImageField(imageUrl);
+    if (!imgCheck.ok) return res.status(400).json({ error: imgCheck.error });
+
     const slug = slugify(title) + '-' + Date.now().toString(36);
 
     const ref = await db.collection('posts').add({
       title,
       slug,
       content,
-      imageUrl: imageUrl || '',
+      imageUrl: imgCheck.value,
       category: category || '',
       tags: Array.isArray(tags) ? tags : [],
       createdAt: admin.firestore.FieldValue.serverTimestamp(),
@@ -310,7 +267,7 @@ app.post('/api/posts', authMiddleware, async (req, res) => {
   }
 });
 
-// PUT /api/posts/:id  (admin only)
+// PUT /api/posts/:id (admin only)
 app.put('/api/posts/:id', authMiddleware, async (req, res) => {
   try {
     const { title, content, imageUrl, category, tags } = req.body || {};
@@ -318,16 +275,12 @@ app.put('/api/posts/:id', authMiddleware, async (req, res) => {
     const doc = await docRef.get();
     if (!doc.exists) return res.status(404).json({ error: 'Post not found' });
 
-    const oldImage = doc.data().imageUrl || '';
-    const newImage = imageUrl || '';
-
-    if (oldImage && newImage && oldImage !== newImage) {
-      await deleteFromCatbox(oldImage);
-    }
+    const imgCheck = validateImageField(imageUrl);
+    if (!imgCheck.ok) return res.status(400).json({ error: imgCheck.error });
 
     const update = {
-      content,
-      imageUrl: newImage,
+      content: content || '',
+      imageUrl: imgCheck.value,
       category: category || '',
       tags: Array.isArray(tags) ? tags : [],
       updatedAt: admin.firestore.FieldValue.serverTimestamp(),
@@ -341,15 +294,11 @@ app.put('/api/posts/:id', authMiddleware, async (req, res) => {
   }
 });
 
-// DELETE /api/posts/:id  (admin only)
+// DELETE /api/posts/:id (admin only)
+// Image is stored inside the document (base64), so no separate cleanup needed
 app.delete('/api/posts/:id', authMiddleware, async (req, res) => {
   try {
-    const docRef = db.collection('posts').doc(req.params.id);
-    const doc = await docRef.get();
-    if (doc.exists) {
-      await deleteFromCatbox(doc.data().imageUrl);
-    }
-    await docRef.delete();
+    await db.collection('posts').doc(req.params.id).delete();
     res.json({ success: true });
   } catch (e) {
     res.status(500).json({ error: e.message });
@@ -363,11 +312,11 @@ app.get('/api', (req, res) =>
   res.json({
     status: 'ok',
     message: 'Nail Arts API is running 🚀',
-    storage: 'catbox',
+    storage: 'firestore-base64',
   })
 );
 
-// Local dev ke liye listen (Vercel pe auto handle hota hai)
+// Local dev
 if (require.main === module) {
   const PORT = process.env.PORT || 3000;
   app.listen(PORT, () => console.log(`✅ Server running on ${PORT}`));

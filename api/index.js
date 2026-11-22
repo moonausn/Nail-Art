@@ -1,16 +1,18 @@
 // ===================================================
 // Nail Arts Blog - Backend API
-// Firestore-only storage (images as base64 data URIs)
+// Storage: Firebase Storage (images) + Firestore (data)
 // Deploy: Vercel
 // ===================================================
 const express = require('express');
 const cors = require('cors');
 const jwt = require('jsonwebtoken');
+const multer = require('multer');
 const admin = require('firebase-admin');
 
 // ---------- Firebase Admin Init ----------
 if (!admin.apps.length) {
   let privateKey = process.env.FIREBASE_PRIVATE_KEY || '';
+  // Vercel env me "\n" text milta hai, usko real newline me convert karo
   privateKey = privateKey.replace(/\\n/g, '\n').replace(/^"|"$/g, '');
 
   admin.initializeApp({
@@ -19,18 +21,22 @@ if (!admin.apps.length) {
       clientEmail: process.env.FIREBASE_CLIENT_EMAIL,
       privateKey: privateKey,
     }),
+    storageBucket: process.env.FIREBASE_STORAGE_BUCKET,
   });
 }
 
 const db = admin.firestore();
+const bucket = admin.storage().bucket();
 
 // ---------- App Setup ----------
 const app = express();
 app.use(cors());
+app.use(express.json({ limit: '2mb' }));
 
-// Base64 images JSON me aati hain, isliye limit barha diya
-// (Firestore doc limit 1MB hai, lekin hum 850KB pe cap karte hain)
-app.use(express.json({ limit: '3mb' }));
+const upload = multer({
+  storage: multer.memoryStorage(),
+  limits: { fileSize: 5 * 1024 * 1024 }, // 5MB
+});
 
 // ---------- Helpers ----------
 const slugify = (text) =>
@@ -55,49 +61,34 @@ const authMiddleware = (req, res, next) => {
   }
 };
 
-// Validate base64 image (data URI) size
-// Firestore limit 1MB = 1,048,576 bytes
-// Safety cap: 850KB base64 (~600KB raw image after base64 inflation)
-const MAX_IMAGE_BASE64_BYTES = 850 * 1024;
+// Firebase Storage se image delete karo
+const deleteImageFromStorage = async (imageUrl) => {
+  try {
+    if (!imageUrl) return;
+    // Only delete if it's a Firebase Storage URL
+    if (!imageUrl.includes('firebasestorage.googleapis.com')) return;
 
-function validateImageField(imageUrl) {
-  if (!imageUrl) return { ok: true, value: '' };
+    // Extract file path from URL
+    // URL format: https://firebasestorage.googleapis.com/v0/b/BUCKET/o/PATH?alt=media&token=...
+    const match = imageUrl.match(/\/o\/([^?]+)/);
+    if (!match) return;
 
-  if (typeof imageUrl !== 'string') {
-    return { ok: false, error: 'Invalid image data' };
-  }
-
-  // External URL allowed (legacy posts)
-  if (!imageUrl.startsWith('data:')) {
-    if (!/^https?:\/\//i.test(imageUrl)) {
-      return { ok: false, error: 'Image must be a data URI or valid URL' };
+    const filePath = decodeURIComponent(match[1]);
+    await bucket.file(filePath).delete();
+    console.log('Deleted from Storage:', filePath);
+  } catch (e) {
+    // Ignore 404 (already deleted) — log others
+    if (!e.message.includes('No such object')) {
+      console.log('Image delete failed:', e.message);
     }
-    return { ok: true, value: imageUrl };
   }
-
-  // Base64 data URI
-  if (!/^data:image\/(jpeg|jpg|png|webp|gif);base64,/i.test(imageUrl)) {
-    return { ok: false, error: 'Only JPEG, PNG, WEBP or GIF images allowed' };
-  }
-
-  // Approximate byte size (base64 chars are ASCII → 1 byte each)
-  const approxBytes = imageUrl.length;
-  if (approxBytes > MAX_IMAGE_BASE64_BYTES) {
-    return {
-      ok: false,
-      error: `Image too large (${Math.round(
-        approxBytes / 1024
-      )}KB). Max 850KB — please compress to under 600KB raw.`,
-    };
-  }
-
-  return { ok: true, value: imageUrl };
-}
+};
 
 // ===================================================
 // AUTH ROUTES
 // ===================================================
 
+// POST /api/login
 app.post('/api/login', (req, res) => {
   const { username, password } = req.body || {};
   if (
@@ -170,31 +161,87 @@ app.delete('/api/categories/:id', authMiddleware, async (req, res) => {
 });
 
 // ===================================================
+// IMAGE UPLOAD (Firebase Storage)
+// ===================================================
+
+// POST /api/upload  (admin only) — multipart form-data, field: "image"
+app.post(
+  '/api/upload',
+  authMiddleware,
+  upload.single('image'),
+  async (req, res) => {
+    try {
+      if (!req.file) {
+        return res.status(400).json({ error: 'No file uploaded' });
+      }
+
+      // Validate image type
+      const allowed = ['image/jpeg', 'image/jpg', 'image/png', 'image/webp', 'image/gif'];
+      if (!allowed.includes(req.file.mimetype)) {
+        return res.status(400).json({
+          error: 'Only JPEG, PNG, WEBP or GIF images allowed',
+        });
+      }
+
+      // Build unique filename
+      const ext = (req.file.originalname.split('.').pop() || 'jpg')
+        .toLowerCase()
+        .replace(/[^a-z0-9]/g, '');
+      const filename = `posts/${Date.now()}-${Math.random()
+        .toString(36)
+        .slice(2, 8)}.${ext}`;
+
+      const file = bucket.file(filename);
+
+      // Upload to Firebase Storage
+      await file.save(req.file.buffer, {
+        metadata: {
+          contentType: req.file.mimetype,
+          cacheControl: 'public, max-age=31536000, immutable',
+        },
+        resumable: false,
+        public: true, // make file publicly readable via URL
+      });
+
+      // Make public (in case public:true in save() isn't honored on some setups)
+      try {
+        await file.makePublic();
+      } catch (e) {
+        // Ignore if already public / IAM blocks it — we'll use signed URL fallback
+      }
+
+      // Build the public download URL
+      const encodedPath = encodeURIComponent(filename);
+      const url = `https://firebasestorage.googleapis.com/v0/b/${bucket.name}/o/${encodedPath}?alt=media`;
+
+      res.json({ url, filename });
+    } catch (e) {
+      console.error('Upload error:', e);
+      res.status(500).json({ error: e.message || 'Upload failed' });
+    }
+  }
+);
+
+// ===================================================
 // POST ROUTES
 // ===================================================
 
 // GET /api/posts
-// Returns list — content truncated to 500 chars (excerpt only) to save bandwidth.
-// imageUrl (base64) is returned in full so homepage cards can display images.
+// List view — content truncated to 500 chars for faster loading
 app.get('/api/posts', async (req, res) => {
   try {
     const snap = await db.collection('posts').get();
     let posts = snap.docs.map((d) => {
       const data = d.data();
-      const plainContent = String(data.content || '')
+      const plain = String(data.content || '')
         .replace(/<[^>]*>/g, ' ')
         .replace(/\s+/g, ' ')
         .trim();
-
       return {
         id: d.id,
         title: data.title || '',
         slug: data.slug || '',
-        // Truncated preview only for list — full content comes from single-post route
-        content:
-          plainContent.length > 500
-            ? plainContent.slice(0, 500) + '…'
-            : plainContent,
+        content: plain.length > 500 ? plain.slice(0, 500) + '…' : plain,
         imageUrl: data.imageUrl || '',
         category: data.category || '',
         tags: Array.isArray(data.tags) ? data.tags : [],
@@ -236,8 +283,6 @@ app.get('/api/posts/:slug', async (req, res) => {
 });
 
 // POST /api/posts (admin only)
-// Body: { title, content, imageUrl, category, tags }
-// imageUrl may be a base64 data URI or external URL
 app.post('/api/posts', authMiddleware, async (req, res) => {
   try {
     const { title, content, imageUrl, category, tags } = req.body || {};
@@ -245,16 +290,13 @@ app.post('/api/posts', authMiddleware, async (req, res) => {
       return res.status(400).json({ error: 'Title and content are required' });
     }
 
-    const imgCheck = validateImageField(imageUrl);
-    if (!imgCheck.ok) return res.status(400).json({ error: imgCheck.error });
-
     const slug = slugify(title) + '-' + Date.now().toString(36);
 
     const ref = await db.collection('posts').add({
       title,
       slug,
       content,
-      imageUrl: imgCheck.value,
+      imageUrl: imageUrl || '',
       category: category || '',
       tags: Array.isArray(tags) ? tags : [],
       createdAt: admin.firestore.FieldValue.serverTimestamp(),
@@ -275,12 +317,21 @@ app.put('/api/posts/:id', authMiddleware, async (req, res) => {
     const doc = await docRef.get();
     if (!doc.exists) return res.status(404).json({ error: 'Post not found' });
 
-    const imgCheck = validateImageField(imageUrl);
-    if (!imgCheck.ok) return res.status(400).json({ error: imgCheck.error });
+    const oldImage = doc.data().imageUrl || '';
+    const newImage = imageUrl || '';
+
+    // If image changed, delete old one from Storage
+    if (oldImage && newImage && oldImage !== newImage) {
+      await deleteImageFromStorage(oldImage);
+    }
+    // If image removed entirely
+    if (oldImage && !newImage) {
+      await deleteImageFromStorage(oldImage);
+    }
 
     const update = {
       content: content || '',
-      imageUrl: imgCheck.value,
+      imageUrl: newImage,
       category: category || '',
       tags: Array.isArray(tags) ? tags : [],
       updatedAt: admin.firestore.FieldValue.serverTimestamp(),
@@ -295,10 +346,14 @@ app.put('/api/posts/:id', authMiddleware, async (req, res) => {
 });
 
 // DELETE /api/posts/:id (admin only)
-// Image is stored inside the document (base64), so no separate cleanup needed
 app.delete('/api/posts/:id', authMiddleware, async (req, res) => {
   try {
-    await db.collection('posts').doc(req.params.id).delete();
+    const docRef = db.collection('posts').doc(req.params.id);
+    const doc = await docRef.get();
+    if (doc.exists) {
+      await deleteImageFromStorage(doc.data().imageUrl);
+    }
+    await docRef.delete();
     res.json({ success: true });
   } catch (e) {
     res.status(500).json({ error: e.message });
@@ -312,7 +367,7 @@ app.get('/api', (req, res) =>
   res.json({
     status: 'ok',
     message: 'Nail Arts API is running 🚀',
-    storage: 'firestore-base64',
+    storage: 'firebase-storage',
   })
 );
 

@@ -33,7 +33,7 @@ app.use(express.json({ limit: '2mb' }));
 
 const upload = multer({
   storage: multer.memoryStorage(),
-  limits: { fileSize: 10 * 1024 * 1024 }, // 10MB (Catbox supports up to 200MB but we keep safe)
+  limits: { fileSize: 10 * 1024 * 1024 }, // 10MB (Catbox supports more, but keep safe)
 });
 
 // ---------- Helpers ----------
@@ -59,6 +59,10 @@ const authMiddleware = (req, res, next) => {
   }
 };
 
+// Browser-like User-Agent to avoid 412 from Catbox
+const BROWSER_UA =
+  'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36';
+
 // ---------- Catbox Upload Helper ----------
 async function uploadToCatbox(buffer, mimetype, originalname) {
   const formData = new FormData();
@@ -75,38 +79,52 @@ async function uploadToCatbox(buffer, mimetype, originalname) {
   const response = await fetch('https://catbox.moe/user/api.php', {
     method: 'POST',
     body: formData,
+    headers: {
+      'User-Agent': BROWSER_UA,
+      'Accept': '*/*',
+      'Accept-Language': 'en-US,en;q=0.9',
+    },
   });
 
   if (!response.ok) {
-    throw new Error(`Catbox upload failed with status ${response.status}`);
+    const errorBody = await response.text().catch(() => '');
+    throw new Error(
+      `Catbox upload failed with status ${response.status}${
+        errorBody ? ` — ${errorBody.substring(0, 200)}` : ''
+      }`
+    );
   }
 
-  const result = await response.text();
+  const result = (await response.text()).trim();
 
-  // Catbox success response ek seedha URL hota hai; error me HTML ya text hota hai
-  if (!/^https?:\/\//i.test(result.trim())) {
-    throw new Error(`Catbox returned invalid response: ${result.substring(0, 200)}`);
+  // Success response ek seedha URL hota hai
+  if (!/^https?:\/\//i.test(result)) {
+    throw new Error(
+      `Catbox returned invalid response: ${result.substring(0, 200)}`
+    );
   }
 
-  return result.trim();
+  return result;
 }
 
 // ---------- Catbox Delete Helper ----------
 async function deleteFromCatbox(imageUrl) {
   try {
     if (!imageUrl || !/catbox\.moe/i.test(imageUrl)) return;
+    if (!process.env.CATBOX_USERHASH) return;
 
     const filename = imageUrl.split('/').pop();
     if (!filename) return;
 
     const formData = new FormData();
     formData.append('reqtype', 'deletefiles');
-    formData.append('userhash', process.env.CATBOX_USERHASH || '');
+    formData.append('userhash', process.env.CATBOX_USERHASH);
     formData.append('files', filename);
 
     await fetch('https://catbox.moe/user/api.php', {
       method: 'POST',
       body: formData,
+      headers: { 'User-Agent': BROWSER_UA },
     });
   } catch (e) {
     console.log('Catbox image delete failed:', e.message);
@@ -136,7 +154,7 @@ app.post('/api/login', (req, res) => {
 // CATEGORY ROUTES
 // ===================================================
 
-// GET /api/categories  (public - frontend slider ke liye)
+// GET /api/categories  (public)
 app.get('/api/categories', async (req, res) => {
   try {
     const snap = await db.collection('categories').get();
@@ -158,7 +176,6 @@ app.post('/api/categories', authMiddleware, async (req, res) => {
 
     const slug = slugify(name);
 
-    // Duplicate check
     const existing = await db
       .collection('categories')
       .where('slug', '==', slug)
@@ -194,7 +211,7 @@ app.delete('/api/categories/:id', authMiddleware, async (req, res) => {
 // IMAGE UPLOAD (via Catbox)
 // ===================================================
 
-// POST /api/upload  (admin only) — multipart form-data, field name: "image"
+// POST /api/upload  (admin only) — multipart form-data, field: "image"
 app.post(
   '/api/upload',
   authMiddleware,
@@ -229,7 +246,7 @@ app.post(
 // POST ROUTES
 // ===================================================
 
-// GET /api/posts  (?category=slug optional)
+// GET /api/posts
 app.get('/api/posts', async (req, res) => {
   try {
     const snap = await db.collection('posts').get();
@@ -248,7 +265,7 @@ app.get('/api/posts', async (req, res) => {
   }
 });
 
-// GET /api/posts/:slug  (single post)
+// GET /api/posts/:slug
 app.get('/api/posts/:slug', async (req, res) => {
   try {
     const snap = await db
@@ -304,7 +321,6 @@ app.put('/api/posts/:id', authMiddleware, async (req, res) => {
     const oldImage = doc.data().imageUrl || '';
     const newImage = imageUrl || '';
 
-    // Agar image change hui to purani Catbox se delete karo
     if (oldImage && newImage && oldImage !== newImage) {
       await deleteFromCatbox(oldImage);
     }
@@ -351,7 +367,7 @@ app.get('/api', (req, res) =>
   })
 );
 
-// Local dev ke liye listen (Vercel pe automatically handle hota hai)
+// Local dev ke liye listen (Vercel pe auto handle hota hai)
 if (require.main === module) {
   const PORT = process.env.PORT || 3000;
   app.listen(PORT, () => console.log(`✅ Server running on ${PORT}`));

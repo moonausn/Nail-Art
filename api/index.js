@@ -1,6 +1,7 @@
 // ===================================================
 // Nail Arts Blog - Backend API
 // All routes in one file, deploy on Vercel
+// Image upload: Catbox.moe (free, no billing)
 // ===================================================
 const express = require('express');
 const cors = require('cors');
@@ -8,7 +9,7 @@ const jwt = require('jsonwebtoken');
 const multer = require('multer');
 const admin = require('firebase-admin');
 
-// ---------- Firebase Admin Init ----------
+// ---------- Firebase Admin Init (Firestore only) ----------
 if (!admin.apps.length) {
   let privateKey = process.env.FIREBASE_PRIVATE_KEY || '';
   // Vercel env me "\n" text milta hai, usko real newline me convert karo
@@ -20,12 +21,10 @@ if (!admin.apps.length) {
       clientEmail: process.env.FIREBASE_CLIENT_EMAIL,
       privateKey: privateKey,
     }),
-    storageBucket: process.env.FIREBASE_STORAGE_BUCKET,
   });
 }
 
 const db = admin.firestore();
-const bucket = admin.storage().bucket();
 
 // ---------- App Setup ----------
 const app = express();
@@ -34,7 +33,7 @@ app.use(express.json({ limit: '2mb' }));
 
 const upload = multer({
   storage: multer.memoryStorage(),
-  limits: { fileSize: 5 * 1024 * 1024 }, // 5MB
+  limits: { fileSize: 10 * 1024 * 1024 }, // 10MB (Catbox supports up to 200MB but we keep safe)
 });
 
 // ---------- Helpers ----------
@@ -60,18 +59,59 @@ const authMiddleware = (req, res, next) => {
   }
 };
 
-// Firebase Storage se image delete karo (jab post delete/update ho)
-const deleteImageFromStorage = async (imageUrl) => {
-  try {
-    if (!imageUrl || !imageUrl.includes('firebasestorage.googleapis.com')) return;
-    const match = imageUrl.match(/\/o\/([^?]+)/);
-    if (!match) return;
-    const filename = decodeURIComponent(match[1]);
-    await bucket.file(filename).delete();
-  } catch (e) {
-    console.log('Image delete failed:', e.message);
+// ---------- Catbox Upload Helper ----------
+async function uploadToCatbox(buffer, mimetype, originalname) {
+  const formData = new FormData();
+  formData.append('reqtype', 'fileupload');
+  if (process.env.CATBOX_USERHASH) {
+    formData.append('userhash', process.env.CATBOX_USERHASH);
   }
-};
+  formData.append(
+    'fileToUpload',
+    new Blob([buffer], { type: mimetype || 'image/jpeg' }),
+    originalname || 'image.jpg'
+  );
+
+  const response = await fetch('https://catbox.moe/user/api.php', {
+    method: 'POST',
+    body: formData,
+  });
+
+  if (!response.ok) {
+    throw new Error(`Catbox upload failed with status ${response.status}`);
+  }
+
+  const result = await response.text();
+
+  // Catbox success response ek seedha URL hota hai; error me HTML ya text hota hai
+  if (!/^https?:\/\//i.test(result.trim())) {
+    throw new Error(`Catbox returned invalid response: ${result.substring(0, 200)}`);
+  }
+
+  return result.trim();
+}
+
+// ---------- Catbox Delete Helper ----------
+async function deleteFromCatbox(imageUrl) {
+  try {
+    if (!imageUrl || !/catbox\.moe/i.test(imageUrl)) return;
+
+    const filename = imageUrl.split('/').pop();
+    if (!filename) return;
+
+    const formData = new FormData();
+    formData.append('reqtype', 'deletefiles');
+    formData.append('userhash', process.env.CATBOX_USERHASH || '');
+    formData.append('files', filename);
+
+    await fetch('https://catbox.moe/user/api.php', {
+      method: 'POST',
+      body: formData,
+    });
+  } catch (e) {
+    console.log('Catbox image delete failed:', e.message);
+  }
+}
 
 // ===================================================
 // AUTH ROUTES
@@ -151,7 +191,7 @@ app.delete('/api/categories/:id', authMiddleware, async (req, res) => {
 });
 
 // ===================================================
-// IMAGE UPLOAD
+// IMAGE UPLOAD (via Catbox)
 // ===================================================
 
 // POST /api/upload  (admin only) — multipart form-data, field name: "image"
@@ -161,26 +201,26 @@ app.post(
   upload.single('image'),
   async (req, res) => {
     try {
-      if (!req.file) return res.status(400).json({ error: 'No file uploaded' });
+      if (!req.file) {
+        return res.status(400).json({ error: 'No file uploaded' });
+      }
 
-      const ext = (req.file.originalname.split('.').pop() || 'jpg').toLowerCase();
-      const filename = `posts/${Date.now()}-${Math.random()
-        .toString(36)
-        .slice(2, 8)}.${ext}`;
-      const file = bucket.file(filename);
+      if (!process.env.CATBOX_USERHASH) {
+        return res
+          .status(500)
+          .json({ error: 'Server misconfigured: CATBOX_USERHASH missing' });
+      }
 
-      await file.save(req.file.buffer, {
-        metadata: { contentType: req.file.mimetype },
-        resumable: false,
-      });
+      const url = await uploadToCatbox(
+        req.file.buffer,
+        req.file.mimetype,
+        req.file.originalname
+      );
 
-      const url = `https://firebasestorage.googleapis.com/v0/b/${
-        bucket.name
-      }/o/${encodeURIComponent(filename)}?alt=media`;
-
-      res.json({ url, filename });
+      res.json({ url, filename: req.file.originalname });
     } catch (e) {
-      res.status(500).json({ error: e.message });
+      console.error('Upload error:', e);
+      res.status(500).json({ error: e.message || 'Upload failed' });
     }
   }
 );
@@ -264,9 +304,9 @@ app.put('/api/posts/:id', authMiddleware, async (req, res) => {
     const oldImage = doc.data().imageUrl || '';
     const newImage = imageUrl || '';
 
-    // Agar image change hui to purani delete karo
+    // Agar image change hui to purani Catbox se delete karo
     if (oldImage && newImage && oldImage !== newImage) {
-      await deleteImageFromStorage(oldImage);
+      await deleteFromCatbox(oldImage);
     }
 
     const update = {
@@ -291,7 +331,7 @@ app.delete('/api/posts/:id', authMiddleware, async (req, res) => {
     const docRef = db.collection('posts').doc(req.params.id);
     const doc = await docRef.get();
     if (doc.exists) {
-      await deleteImageFromStorage(doc.data().imageUrl);
+      await deleteFromCatbox(doc.data().imageUrl);
     }
     await docRef.delete();
     res.json({ success: true });
@@ -304,7 +344,11 @@ app.delete('/api/posts/:id', authMiddleware, async (req, res) => {
 // HEALTH CHECK
 // ===================================================
 app.get('/api', (req, res) =>
-  res.json({ status: 'ok', message: 'Nail Arts API is running 🚀' })
+  res.json({
+    status: 'ok',
+    message: 'Nail Arts API is running 🚀',
+    storage: 'catbox',
+  })
 );
 
 // Local dev ke liye listen (Vercel pe automatically handle hota hai)
